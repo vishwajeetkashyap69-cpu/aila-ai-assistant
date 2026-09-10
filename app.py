@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import base64
 import threading
 import time
 from pathlib import Path
@@ -10,8 +11,7 @@ import pyttsx3
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, Response
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from groq import Groq
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -22,14 +22,18 @@ BASE_DIR = Path(__file__).resolve().parent
 
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
+API_KEY = os.getenv("GROQ_API_KEY")
 
 if not API_KEY:
     raise RuntimeError(
-        "GEMINI_API_KEY नहीं मिली। .env file check करें।"
+        "GROQ_API_KEY नहीं मिली। .env file या Render Environment Variables check करें।"
     )
 
-client = genai.Client(api_key=API_KEY)
+client = Groq(api_key=API_KEY)
+
+TEXT_MODEL = "openai/gpt-oss-20b"
+VISION_MODEL = "qwen/qwen3.8-27b"
+WEB_MODEL = "groq/compound"
 
 app = FastAPI(title="Aila AI Assistant")
 
@@ -892,52 +896,91 @@ Active file: {active_file_name or "कोई file upload नहीं है"}
 USER QUESTION:
 {question}
 """
-    models = ["gemini-3-flash-preview", "gemini-3.5-flash-lite"]
-
-    def call_model(model, use_search):
-        config = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())]) if use_search else None
-        contents = prompt
-        if active_image_data and active_image_mime:
-            contents = [prompt, types.Part.from_bytes(data=active_image_data, mime_type=active_image_mime)]
-        return client.models.generate_content(model=model, contents=contents, config=config)
-
     response = None
     search_used = False
     last_error = None
-    if web_search:
-        for model in models:
-            try:
-                response = call_model(model, True)
-                search_used = True
-                break
-            except Exception as error:
-                last_error = error
-    if response is None:
-        for model in models:
-            try:
-                response = call_model(model, False)
-                search_used = False
-                break
-            except Exception as error:
-                last_error = error
-    if response is None:
-        return {"question": question, "answer": "❌ अभी AI server से जवाब नहीं मिल पाया। थोड़ी देर बाद फिर कोशिश करें।", "error": str(last_error)}
 
-    answer = (response.text or "मुझे जवाब नहीं मिला।").strip()
-    if search_used:
-        sources = []
+    def call_groq(model, use_search=False):
+        if active_image_data and active_image_mime:
+            encoded = base64.b64encode(active_image_data).decode("utf-8")
+            messages = [
+                {
+                    "role": "system",
+                    "content": "You are Aila, a helpful personal AI assistant. Answer clearly and naturally. Follow the user's language. Use Hindi when the user asks in Hindi."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{active_image_mime};base64,{encoded}"
+                            }
+                        }
+                    ]
+                }
+            ]
+            return client.chat.completions.create(
+                model=VISION_MODEL,
+                messages=messages,
+                temperature=0.4,
+                max_completion_tokens=4096,
+            )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are Aila, a helpful personal AI assistant. Answer clearly, accurately and naturally. Follow the user's language. Use Hindi when the user asks in Hindi."
+            },
+            {"role": "user", "content": prompt}
+        ]
+
+        if use_search:
+            return client.chat.completions.create(
+                model=WEB_MODEL,
+                messages=messages,
+            )
+
+        return client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=0.4,
+            max_completion_tokens=4096,
+        )
+
+    if web_search and not (active_image_data and active_image_mime):
         try:
-            metadata = response.candidates[0].grounding_metadata
-            for chunk in (getattr(metadata, "grounding_chunks", None) or []):
-                web = getattr(chunk, "web", None)
-                uri = getattr(web, "uri", None) if web else None
-                title = getattr(web, "title", None) if web else None
-                if uri and uri not in [x[1] for x in sources]:
-                    sources.append((title or uri, uri))
-        except Exception:
-            pass
-        if sources:
-            answer += "\n\n## 🌐 स्रोत\n" + "\n".join(f"- {title} — {uri}" for title, uri in sources[:8])
+            response = call_groq(WEB_MODEL, True)
+            search_used = True
+        except Exception as error:
+            last_error = error
+
+    if response is None:
+        try:
+            response = call_groq(
+                VISION_MODEL if (active_image_data and active_image_mime) else TEXT_MODEL,
+                False
+            )
+            search_used = False
+        except Exception as error:
+            last_error = error
+
+    if response is None:
+        return {
+            "question": question,
+            "answer": "❌ अभी AI server से जवाब नहीं मिल पाया। थोड़ी देर बाद फिर कोशिश करें।",
+            "error": str(last_error),
+        }
+
+    try:
+        answer = (response.choices[0].message.content or "मुझे जवाब नहीं मिला।").strip()
+    except Exception as error:
+        return {
+            "question": question,
+            "answer": "❌ AI से response मिला, लेकिन उसे पढ़ने में समस्या हुई।",
+            "error": str(error),
+        }
 
     save_match = re.search(r"MEMORY_SAVE:\s*(.+)", answer, re.IGNORECASE)
     if save_match:
