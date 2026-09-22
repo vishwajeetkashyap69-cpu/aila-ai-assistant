@@ -32,8 +32,8 @@ if not API_KEY:
 client = Groq(api_key=API_KEY)
 
 TEXT_MODEL = "openai/gpt-oss-20b"
-VISION_MODEL = "qwen/qwen3.8-27b"
-WEB_MODEL = "groq/compound"
+VISION_MODEL = "qwen/qwen3.6-27b"
+WEB_MODEL = "openai/gpt-oss-20b"
 
 app = FastAPI(title="Aila AI Assistant")
 
@@ -396,7 +396,7 @@ setTimeout(cleanupDuplicateUI, 1500);
 
 let deferredInstallPrompt = null;
 let voiceEnabled = false;
-let webSearchEnabled = true;
+let webSearchEnabled = false;
 function escapeHtml(text) { return String(text).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;"); }
 function renderAilaText(text) {
     let s=escapeHtml(text).replace(/\r\n/g,"\n");
@@ -428,9 +428,11 @@ function speak(text,force) {
 }
 webSearchBtn.addEventListener("click",function(){webSearchEnabled=!webSearchEnabled;webSearchBtn.innerText=webSearchEnabled?"🌐 Web Search: ON":"🌐 Web Search: OFF";statusText.innerText=webSearchEnabled?"Web Search चालू है।":"Web Search बंद है।";});
 voiceBtn.addEventListener("click",function(){voiceEnabled=!voiceEnabled;if(voiceEnabled){voiceBtn.innerText="🔊 Voice ON ✓";speak("नमस्ते भाई जी, अब मैं आपको बोलकर भी समझा सकती हूँ।",true);}else{speechSynthesis.cancel();voiceBtn.innerText="🔇 Voice OFF";}});
+let askingAI=false;
 async function askAI(){
-    const question=input.value.trim(); if(!question)return; addMessage(question,"user"); input.value=""; statusText.innerText="Aila सोच रही है...";
-    try{const response=await fetch("/ask?question="+encodeURIComponent(question)+"&web_search="+(webSearchEnabled?"true":"false")); const data=await response.json(); if(data.answer){addMessage(data.answer,"ai");const wantsVoice=/बोलकर|बोल के|आवाज़ से|आवाज से|सुनाकर|सुना दो|बोलो|voice|speak/i.test(question);if(wantsVoice)voiceEnabled=true;if(voiceEnabled||wantsVoice)speak(data.answer,true);}else addMessage("❌ जवाब नहीं मिला।","ai");}catch(error){addMessage("❌ Server से connection नहीं हो पाया।","ai");console.log(error);} statusText.innerText="";
+    if(askingAI)return;
+    const question=input.value.trim(); if(!question)return; askingAI=true; sendBtn.disabled=true; addMessage(question,"user"); input.value=""; statusText.innerText="Aila सोच रही है...";
+    try{const response=await fetch("/ask?question="+encodeURIComponent(question)+"&web_search="+(webSearchEnabled?"true":"false")); const data=await response.json(); if(data.answer){addMessage(data.answer,"ai");const wantsVoice=/बोलकर|बोल के|आवाज़ से|आवाज से|सुनाकर|सुना दो|बोलो|voice|speak/i.test(question);if(wantsVoice)voiceEnabled=true;if(voiceEnabled||wantsVoice)speak(data.answer,true);}else addMessage("❌ जवाब नहीं मिला।","ai");}catch(error){addMessage("❌ Server से connection नहीं हो पाया।","ai");console.log(error);} statusText.innerText=""; askingAI=false; sendBtn.disabled=false;
 }
 sendBtn.addEventListener("click",askAI); input.addEventListener("keydown",function(e){if(e.key==="Enter")askAI();});
 const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition; let recognition=null;
@@ -854,15 +856,36 @@ def clear_memory():
 # ==================================================
 
 @app.get("/ask")
-def ask(question: str, web_search: bool = True):
+def ask(question: str, web_search: bool = False):
     global active_image_data, active_image_mime
     question = question.strip()
     if not question:
         return {"answer": "कृपया कोई सवाल लिखिए।"}
 
-    conversation = "".join("User: " + str(i.get("question", "")) + "\nAila: " + str(i.get("answer", "")) + "\n\n" for i in chat_history[-10:])
+    # Keep each Groq request comfortably below the TPM/context limit.
+    # Existing history and memory are preserved on disk; only a bounded slice
+    # is sent to the model for each request.
+    history_parts = []
+    history_chars = 0
+    for item in reversed(chat_history[-10:]):
+        part = "User: " + str(item.get("question", "")) + "\nAila: " + str(item.get("answer", "")) + "\n\n"
+        if history_chars + len(part) > 6000:
+            break
+        history_parts.append(part)
+        history_chars += len(part)
+    conversation = "".join(reversed(history_parts)) or "(अभी कोई chat history नहीं है)"
+
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-    memory_context = "\n".join(f"- {item}" for item in long_term_memories[-50:]) or "(अभी कोई long-term memory नहीं है)"
+    memory_items = []
+    memory_chars = 0
+    for item in reversed(long_term_memories[-50:]):
+        part = "- " + str(item) + "\n"
+        if memory_chars + len(part) > 3000:
+            break
+        memory_items.append(part)
+        memory_chars += len(part)
+    memory_context = "".join(reversed(memory_items)).strip() or "(अभी कोई long-term memory नहीं है)"
+
     prompt = f"""
 तुम Aila नाम की intelligent AI Assistant हो।
 वर्तमान तारीख और समय: {current_time}
@@ -891,7 +914,7 @@ CHAT HISTORY:
 
 FILE CONTEXT:
 Active file: {active_file_name or "कोई file upload नहीं है"}
-{active_file_text[:60000] if active_file_text else "(कोई text file context नहीं)"}
+{active_file_text[:12000] if active_file_text else "(कोई text file context नहीं)"}
 
 USER QUESTION:
 {question}
@@ -924,8 +947,8 @@ USER QUESTION:
             return client.chat.completions.create(
                 model=VISION_MODEL,
                 messages=messages,
-                temperature=0.4,
                 max_completion_tokens=4096,
+                stream=False,
             )
 
         messages = [
@@ -936,22 +959,26 @@ USER QUESTION:
             {"role": "user", "content": prompt}
         ]
 
+        kwargs = {
+            "model": TEXT_MODEL,
+            "messages": messages,
+            "max_completion_tokens": 4096,
+            "stream": False,
+            "include_reasoning": False,
+        }
+
+        # Groq's current browser-search tool is supported by GPT-OSS 20B.
         if use_search:
-            return client.chat.completions.create(
-                model=WEB_MODEL,
-                messages=messages,
-            )
+            kwargs["tool_choice"] = "required"
+            kwargs["tools"] = [{"type": "browser_search"}]
 
-        return client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.4,
-            max_completion_tokens=4096,
-        )
+        return client.chat.completions.create(**kwargs)
 
+    # First make normal chat reliable. Web Search is optional and uses the
+    # documented browser_search tool on the same GPT-OSS 20B model.
     if web_search and not (active_image_data and active_image_mime):
         try:
-            response = call_groq(WEB_MODEL, True)
+            response = call_groq(TEXT_MODEL, True)
             search_used = True
         except Exception as error:
             last_error = error
